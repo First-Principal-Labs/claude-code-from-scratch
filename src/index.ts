@@ -1,154 +1,200 @@
 /**
- * Claude from Scratch — Chapter 1: The Context Engineering Manifesto
+ * Claude from Scratch — Chapter 2: The Anatomy of Context
  *
- * Our first API call to the Anthropic Messages API.
- * This is the simplest possible context: a brief system prompt
- * and a single user message. Everything else in this book builds
- * upon this foundation.
+ * WHAT'S NEW IN THIS CHAPTER:
+ *   - Interactive CLI loop (readline-based)
+ *   - Token counting and budget display
+ *   - Message builder for structured message creation
+ *   - Per-turn and session-level token tracking
+ *   - Context window utilization display
+ *
+ * CONTEXT ENGINEERING CONCEPTS:
+ *   - Messages API format (system, user, assistant roles)
+ *   - Tokens as the atomic unit of context
+ *   - Context windows as the fundamental constraint
+ *   - Token budget awareness
  *
  * Usage:
  *   npx tsx src/index.ts
  *
- * Prerequisites:
- *   - ANTHROPIC_API_KEY set in environment or .env file
- *   - npm install completed
+ * Type a message and press Enter to chat. Type "quit" to exit.
+ * After each response, token usage is displayed.
  */
 
 import Anthropic from "@anthropic-ai/sdk";
+import * as readline from "node:readline";
+import { config } from "./config.js";
+import { MessageBuilder, type Message } from "./core/messages.js";
+import {
+  TokenTracker,
+  estimateTokens,
+  calculateBudget,
+  formatTokenCount,
+  contextUtilization,
+} from "./core/tokens.js";
 
-// Initialize the Anthropic client.
-// The SDK automatically reads ANTHROPIC_API_KEY from the environment.
+// -----------------------------------------------------------------------
+// Initialize
+// -----------------------------------------------------------------------
+
 const client = new Anthropic();
+const tokenTracker = new TokenTracker();
 
-async function main(): Promise<void> {
-  console.log("=".repeat(60));
-  console.log("  Claude from Scratch — Chapter 1");
-  console.log("  The Context Engineering Manifesto");
-  console.log("=".repeat(60));
-  console.log();
+// The system prompt — still simple for now. Chapter 3 will expand this
+// into a full system prompt with environment detection.
+const SYSTEM_PROMPT = "You are a helpful coding assistant. Be concise.";
 
-  // -----------------------------------------------------------------
-  // THE API CALL
-  //
-  // This is the fundamental operation. Every interaction with Claude
-  // goes through client.messages.create(). The parameters define the
-  // CONTEXT that the model receives:
-  //
-  //   model      → which Claude model to use
-  //   max_tokens → maximum output tokens the model can generate
-  //   system     → the system prompt (model's identity and rules)
-  //   messages   → the conversation history (user and assistant turns)
-  //
-  // In later chapters, we will add:
-  //   tools      → tool definitions (Ch 5)
-  //   stream     → streaming responses (Ch 17)
-  //   metadata   → request metadata
-  // -----------------------------------------------------------------
+// -----------------------------------------------------------------------
+// Interactive CLI
+//
+// CONTEXT ENGINEERING CONCEPT: Single-Turn Interaction
+//
+// In this chapter, each exchange is a single turn: one user message,
+// one assistant response. The model has NO memory of previous turns.
+// Every API call is independent — the model sees only the system
+// prompt and the current user message.
+//
+// In Chapter 4, we will add conversation history to create the
+// ILLUSION of memory by resending all previous messages each turn.
+// -----------------------------------------------------------------------
 
-  console.log("Making our first API call...\n");
+async function chat(userInput: string): Promise<string> {
+  // Build the user message using our message builder
+  const userMessage: Message = MessageBuilder.user(userInput);
+
+  // Estimate input tokens before the API call
+  const estimatedInput =
+    estimateTokens(SYSTEM_PROMPT) + estimateTokens(userInput);
 
   const message = await client.messages.create({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 1024,
-
-    // The system prompt: the model's identity and behavioral rules.
-    // Right now, a single sentence. By Chapter 3, this will be a
-    // carefully designed document of thousands of tokens.
-    system: "You are a helpful coding assistant.",
-
-    // The conversation history: an array of message objects.
-    // Right now, a single user message. By Chapter 4, we will
-    // manage a growing history across multiple turns.
-    messages: [
-      {
-        role: "user",
-        content: "What is context engineering? Answer in 2-3 sentences.",
-      },
-    ],
+    model: config.model,
+    max_tokens: config.maxTokens,
+    system: SYSTEM_PROMPT,
+    messages: [userMessage],
   });
 
-  // -----------------------------------------------------------------
-  // RESPONSE PROCESSING
-  //
-  // The response's `content` is an array of content blocks.
-  // Each block has a `type`:
-  //   - "text"     → a text response from the model
-  //   - "tool_use" → a tool call request (we'll add this in Ch 5)
-  //
-  // For now, we only expect text blocks.
-  // -----------------------------------------------------------------
+  // Record actual token usage from the API response
+  tokenTracker.recordUsage({
+    inputTokens: message.usage.input_tokens,
+    outputTokens: message.usage.output_tokens,
+  });
 
+  // Extract text from response
   const textBlock = message.content.find((block) => block.type === "text");
+  const responseText =
+    textBlock && textBlock.type === "text"
+      ? textBlock.text
+      : "(no text response)";
 
-  if (textBlock && textBlock.type === "text") {
-    console.log("Response:");
-    console.log("-".repeat(60));
-    console.log(textBlock.text);
-    console.log("-".repeat(60));
-  }
-
-  // -----------------------------------------------------------------
-  // TOKEN USAGE
-  //
-  // Every API call reports token usage. Understanding these numbers
-  // is essential to context engineering:
-  //
-  //   input_tokens  → tokens sent TO the model (system + messages)
-  //   output_tokens → tokens generated BY the model
-  //
-  // Cost = (input_tokens × input_price) + (output_tokens × output_price)
-  //
-  // In Chapter 10, we'll build a token budget tracker.
-  // In Chapter 13, we'll optimize costs with prompt caching.
-  // -----------------------------------------------------------------
+  // Display token usage for this turn
+  const budget = calculateBudget();
+  const totalThisTurn =
+    message.usage.input_tokens + message.usage.output_tokens;
+  const utilization = contextUtilization(message.usage.input_tokens);
 
   console.log();
-  console.log("Token Usage:");
-  console.log(`  Input tokens:  ${message.usage.input_tokens}`);
-  console.log(`  Output tokens: ${message.usage.output_tokens}`);
   console.log(
-    `  Total tokens:  ${message.usage.input_tokens + message.usage.output_tokens}`
+    `  Tokens: ${message.usage.input_tokens} in → ${message.usage.output_tokens} out (${totalThisTurn} total)`
+  );
+  console.log(
+    `  Estimate was: ~${estimatedInput} tokens (actual: ${message.usage.input_tokens})`
+  );
+  console.log(
+    `  Window: ${formatTokenCount(message.usage.input_tokens)} / ${formatTokenCount(budget.total)} (${utilization.toFixed(1)}% used)`
   );
   console.log();
-  console.log("Response Metadata:");
-  console.log(`  Model:         ${message.model}`);
-  console.log(`  Stop reason:   ${message.stop_reason}`);
-  console.log(`  Response ID:   ${message.id}`);
 
-  // -----------------------------------------------------------------
-  // WHAT'S NOT HERE YET
-  //
-  // This is the simplest possible context. Here's what we'll add:
-  //
-  //   Ch 2  → Token counting and an interactive CLI
-  //   Ch 3  → A real system prompt with environment detection
-  //   Ch 4  → Multi-turn conversation history management
-  //   Ch 5  → Tool definitions (Read, Write, Edit, Bash, Grep...)
-  //   Ch 6  → The agent loop (think → act → observe → repeat)
-  //   Ch 10 → Context compression for long sessions
-  //   Ch 11 → Persistent memory (CLAUDE.md, auto-memory)
-  //   Ch 12 → Dynamic context assembly pipeline
-  //   Ch 13 → Prompt caching and cost optimization
-  //   Ch 16 → Permission system and safety checks
-  //   Ch 17 → Streaming for real-time output
-  // -----------------------------------------------------------------
+  return responseText;
+}
 
+// -----------------------------------------------------------------------
+// Main — CLI Loop
+// -----------------------------------------------------------------------
+
+async function main(): Promise<void> {
+  const budget = calculateBudget();
+
+  console.log("=".repeat(60));
+  console.log("  Claude from Scratch — Chapter 2");
+  console.log("  The Anatomy of Context");
+  console.log("=".repeat(60));
   console.log();
-  console.log("=".repeat(60));
-  console.log("  Chapter 1 complete. Next: Ch 2 — Tokens & Windows");
-  console.log("=".repeat(60));
+  console.log(`  Model:          ${config.model}`);
+  console.log(
+    `  Context window: ${formatTokenCount(budget.total)} tokens`
+  );
+  console.log(
+    `  Max output:     ${formatTokenCount(budget.reservedForOutput)} tokens`
+  );
+  console.log(
+    `  Input budget:   ${formatTokenCount(budget.availableForInput)} tokens`
+  );
+  console.log();
+  console.log("  Type a message to chat. Type 'quit' to exit.");
+  console.log(
+    "  Each message is independent (no conversation memory yet)."
+  );
+  console.log("-".repeat(60));
+  console.log();
+
+  // Set up readline for interactive input
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  const prompt = (): void => {
+    rl.question("You: ", async (input) => {
+      const trimmed = input.trim();
+
+      // Exit conditions
+      if (!trimmed) {
+        prompt();
+        return;
+      }
+
+      if (
+        trimmed.toLowerCase() === "quit" ||
+        trimmed.toLowerCase() === "exit"
+      ) {
+        console.log();
+        console.log("-".repeat(60));
+        console.log(tokenTracker.formatSessionSummary());
+        console.log("-".repeat(60));
+        console.log();
+        console.log(
+          "  Chapter 2 complete. Next: Ch 3 — System Prompts"
+        );
+        console.log();
+        rl.close();
+        return;
+      }
+
+      try {
+        const response = await chat(trimmed);
+        console.log(`Claude: ${response}`);
+        console.log();
+      } catch (error) {
+        if (error instanceof Error) {
+          console.error(`Error: ${error.message}`);
+
+          if (error.message.includes("API key")) {
+            console.error(
+              "Hint: Set ANTHROPIC_API_KEY in your environment or .env file."
+            );
+          }
+        }
+        console.log();
+      }
+
+      prompt();
+    });
+  };
+
+  prompt();
 }
 
 main().catch((error: Error) => {
-  console.error("Error:", error.message);
-
-  if (error.message.includes("API key")) {
-    console.error(
-      "\nHint: Make sure ANTHROPIC_API_KEY is set in your environment."
-    );
-    console.error("  export ANTHROPIC_API_KEY=sk-ant-your-key-here");
-    console.error("  Or create a .env file (see .env.example)");
-  }
-
+  console.error("Fatal error:", error.message);
   process.exit(1);
 });
