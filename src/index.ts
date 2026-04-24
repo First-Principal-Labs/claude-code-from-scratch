@@ -1,24 +1,24 @@
 /**
- * Claude Code from Scratch — Chapter 2: The Anatomy of Context
+ * Claude Code from Scratch — Chapter 3: System Prompts
  *
  * WHAT'S NEW IN THIS CHAPTER:
- *   - Interactive CLI loop (readline-based)
- *   - Token counting and budget display
- *   - Message builder for structured message creation
- *   - Per-turn and session-level token tracking
- *   - Context window utilization display
+ *   - Real system prompt loaded from a template file
+ *   - Template variable injection (OS, shell, cwd, date)
+ *   - Environment detection
+ *   - Multi-turn conversation (the model now remembers previous turns!)
+ *   - Conversation statistics display
  *
  * CONTEXT ENGINEERING CONCEPTS:
- *   - Messages API format (system, user, assistant roles)
- *   - Tokens as the atomic unit of context
- *   - Context windows as the fundamental constraint
- *   - Token budget awareness
+ *   - System prompt design (identity, rules, format, safety)
+ *   - Instruction hierarchy (system > user > assistant > tool_result)
+ *   - Template variables / dynamic system prompts
+ *   - Multi-turn conversation via message history resending
  *
  * Usage:
  *   npx tsx src/index.ts
  *
- * Type a message and press Enter to chat. Type "quit" to exit.
- * After each response, token usage is displayed.
+ * Type a message and press Enter to chat. The model now remembers
+ * the conversation! Type "quit" to exit, "/clear" to reset.
  */
 
 // Must be the first import — silences Node's DEP0040 punycode warning
@@ -27,14 +27,18 @@ import "./silence.js";
 import Anthropic from "@anthropic-ai/sdk";
 import * as readline from "node:readline";
 import { config } from "./config.js";
-import { MessageBuilder, type Message } from "./core/messages.js";
 import {
   TokenTracker,
-  estimateTokens,
   calculateBudget,
   formatTokenCount,
   contextUtilization,
 } from "./core/tokens.js";
+import { buildSystemPrompt } from "./core/system-prompt.js";
+import {
+  detectEnvironment,
+  formatEnvironmentForDisplay,
+} from "./core/environment.js";
+import { Conversation } from "./core/conversation.js";
 
 // -----------------------------------------------------------------------
 // Initialize
@@ -42,41 +46,41 @@ import {
 
 const client = new Anthropic();
 const tokenTracker = new TokenTracker();
+const conversation = new Conversation();
 
-// The system prompt — still simple for now. Chapter 3 will expand this
-// into a full system prompt with environment detection.
-const SYSTEM_PROMPT = "You are a helpful coding assistant. Be concise.";
+// Build the system prompt with environment variables injected
+const systemPrompt = buildSystemPrompt();
 
 // -----------------------------------------------------------------------
-// Interactive CLI
+// Multi-Turn Chat
 //
-// CONTEXT ENGINEERING CONCEPT: Single-Turn Interaction
+// CONTEXT ENGINEERING CONCEPT: Conversation History
 //
-// In this chapter, each exchange is a single turn: one user message,
-// one assistant response. The model has NO memory of previous turns.
-// Every API call is independent — the model sees only the system
-// prompt and the current user message.
+// THIS IS THE KEY CHANGE FROM CHAPTER 2.
 //
-// In Chapter 4, we will add conversation history to create the
-// ILLUSION of memory by resending all previous messages each turn.
+// In Chapter 2, we sent a single message per API call — no history.
+// Now, we maintain a Conversation object that accumulates all
+// messages. Every API call sends the FULL HISTORY.
+//
+// The model sees:
+//   [system prompt] + [user 1] + [assistant 1] + [user 2] + ...
+//
+// This creates the illusion of memory. The model doesn't actually
+// remember anything — we just resend everything it needs to know.
 // -----------------------------------------------------------------------
 
 async function chat(userInput: string): Promise<string> {
-  // Build the user message using our message builder
-  const userMessage: Message = MessageBuilder.user(userInput);
-
-  // Estimate input tokens before the API call
-  const estimatedInput =
-    estimateTokens(SYSTEM_PROMPT) + estimateTokens(userInput);
+  // Add the user's message to conversation history
+  conversation.addUserMessage(userInput);
 
   const message = await client.messages.create({
     model: config.model,
     max_tokens: config.maxTokens,
-    system: SYSTEM_PROMPT,
-    messages: [userMessage],
+    system: systemPrompt.text,
+    messages: conversation.getMessages(), // ← FULL HISTORY sent every time
   });
 
-  // Record actual token usage from the API response
+  // Record token usage
   tokenTracker.recordUsage({
     inputTokens: message.usage.input_tokens,
     outputTokens: message.usage.output_tokens,
@@ -89,21 +93,17 @@ async function chat(userInput: string): Promise<string> {
       ? textBlock.text
       : "(no text response)";
 
-  // Display token usage for this turn
+  // Add assistant response to conversation history
+  conversation.addAssistantMessage(responseText);
+
+  // Display per-turn stats
   const budget = calculateBudget();
-  const totalThisTurn =
-    message.usage.input_tokens + message.usage.output_tokens;
   const utilization = contextUtilization(message.usage.input_tokens);
+  const stats = conversation.getStats();
 
   console.log();
   console.log(
-    `  Tokens: ${message.usage.input_tokens} in → ${message.usage.output_tokens} out (${totalThisTurn} total)`
-  );
-  console.log(
-    `  Estimate was: ~${estimatedInput} tokens (actual: ${message.usage.input_tokens})`
-  );
-  console.log(
-    `  Window: ${formatTokenCount(message.usage.input_tokens)} / ${formatTokenCount(budget.total)} (${utilization.toFixed(1)}% used)`
+    `  [Turn ${stats.turnCount}] ${message.usage.input_tokens} in → ${message.usage.output_tokens} out | Window: ${utilization.toFixed(1)}% used`
   );
   console.log();
 
@@ -111,36 +111,37 @@ async function chat(userInput: string): Promise<string> {
 }
 
 // -----------------------------------------------------------------------
-// Main — CLI Loop
+// Main — CLI Loop with Multi-Turn
 // -----------------------------------------------------------------------
 
 async function main(): Promise<void> {
   const budget = calculateBudget();
+  const env = detectEnvironment();
 
   console.log("=".repeat(60));
-  console.log("  Claude Code from Scratch — Chapter 2");
-  console.log("  The Anatomy of Context");
+  console.log("  Claude Code from Scratch — Chapter 3");
+  console.log("  System Prompts: Programming the Brain");
   console.log("=".repeat(60));
+  console.log();
+  console.log(formatEnvironmentForDisplay(env));
   console.log();
   console.log(`  Model:          ${config.model}`);
   console.log(
     `  Context window: ${formatTokenCount(budget.total)} tokens`
   );
   console.log(
-    `  Max output:     ${formatTokenCount(budget.reservedForOutput)} tokens`
-  );
-  console.log(
-    `  Input budget:   ${formatTokenCount(budget.availableForInput)} tokens`
+    `  System prompt:  ~${systemPrompt.estimatedTokens} tokens`
   );
   console.log();
-  console.log("  Type a message to chat. Type 'quit' to exit.");
   console.log(
-    "  Each message is independent (no conversation memory yet)."
+    "  The model now remembers the conversation!"
+  );
+  console.log(
+    "  Commands: /clear (reset), /stats (usage), /prompt (view), quit"
   );
   console.log("-".repeat(60));
   console.log();
 
-  // Set up readline for interactive input
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -150,12 +151,12 @@ async function main(): Promise<void> {
     rl.question("You: ", async (input) => {
       const trimmed = input.trim();
 
-      // Exit conditions
       if (!trimmed) {
         prompt();
         return;
       }
 
+      // Handle exit
       if (
         trimmed.toLowerCase() === "quit" ||
         trimmed.toLowerCase() === "exit"
@@ -163,13 +164,52 @@ async function main(): Promise<void> {
         console.log();
         console.log("-".repeat(60));
         console.log(tokenTracker.formatSessionSummary());
+        const stats = conversation.getStats();
+        console.log(`  Turns:          ${stats.turnCount}`);
+        console.log(`  History tokens: ~${stats.estimatedTokens}`);
         console.log("-".repeat(60));
         console.log();
         console.log(
-          "  Chapter 2 complete. Next: Ch 3 — System Prompts"
+          "  Chapter 3 complete. Next: Ch 4 — Conversation Management"
         );
         console.log();
         rl.close();
+        return;
+      }
+
+      // Handle slash commands
+      if (trimmed.toLowerCase() === "/clear") {
+        conversation.clear();
+        console.log("  Conversation cleared. Starting fresh.\n");
+        prompt();
+        return;
+      }
+
+      if (trimmed.toLowerCase() === "/stats") {
+        const stats = conversation.getStats();
+        const sessionUsage = tokenTracker.getSessionUsage();
+        console.log();
+        console.log(`  Messages:       ${stats.messageCount}`);
+        console.log(`  Turns:          ${stats.turnCount}`);
+        console.log(`  History tokens: ~${stats.estimatedTokens}`);
+        console.log(
+          `  System prompt:  ~${systemPrompt.estimatedTokens} tokens`
+        );
+        console.log(
+          `  Session cost:   $${sessionUsage.estimatedCost.toFixed(4)}`
+        );
+        console.log();
+        prompt();
+        return;
+      }
+
+      if (trimmed.toLowerCase() === "/prompt") {
+        console.log();
+        console.log("--- System Prompt ---");
+        console.log(systemPrompt.text);
+        console.log("--- End System Prompt ---");
+        console.log();
+        prompt();
         return;
       }
 
@@ -180,7 +220,6 @@ async function main(): Promise<void> {
       } catch (error) {
         if (error instanceof Error) {
           console.error(`Error: ${error.message}`);
-
           if (error.message.includes("API key")) {
             console.error(
               "Hint: Set ANTHROPIC_API_KEY in your environment or .env file."
