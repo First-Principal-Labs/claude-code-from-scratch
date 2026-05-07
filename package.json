@@ -1,11 +1,11 @@
 {
   "name": "claude-from-scratch",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Build an AI coding agent from scratch — learning context engineering step by step",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "start": "tsx src/index.ts",
+    "start": "NODE_OPTIONS='--no-deprecation' tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit"

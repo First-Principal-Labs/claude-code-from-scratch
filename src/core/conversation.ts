@@ -1,28 +1,26 @@
 /**
- * Conversation History Manager — Chapter 3
+ * Conversation History Manager — Chapter 4 (Enhanced)
  *
- * CONTEXT ENGINEERING CONCEPT: Multi-Turn Conversation
+ * CONTEXT ENGINEERING CONCEPT: Conversation State Management
  *
- * LLMs are stateless — they have zero memory between API calls.
- * To create the ILLUSION of an ongoing conversation, we must
- * resend the ENTIRE conversation history with every request.
+ * Enhanced from Chapter 3 with:
+ *   - Conversation IDs for tracking
+ *   - Persistence support (save/load via HistoryManager)
+ *   - Token budget awareness (warns when approaching limits)
+ *   - Richer statistics
  *
- * This means:
- *   - Every previous user message is included
- *   - Every previous assistant response is included
- *   - The context grows by ~2 messages per turn
- *   - Eventually, the context window will fill up
+ * CONCEPT: The Message Array IS the State
  *
- * This module manages that growing history. In Chapter 10, we will
- * add compression to handle the case when history exceeds the budget.
- * For now, we simply maintain and return the full history.
+ * In a stateless system, the conversation's message array is the
+ * COMPLETE state. There is no hidden state, no server-side session.
+ * If the array has 20 messages, the model knows 20 messages.
  *
- * CONCEPT: Memory Is Just Resending
+ * CONCEPT: Context Pressure
  *
- * There is no magic to LLM "memory." When the model appears to
- * remember what you said 5 turns ago, it's because we literally
- * included that message in the current request. If we omit it,
- * the model has no idea it ever happened.
+ * Every turn adds ~500-2000 tokens. The window doesn't grow.
+ * Eventually, something has to give:
+ *   - This chapter: we warn when approaching limits
+ *   - Chapter 10: we compress old messages automatically
  */
 
 import {
@@ -30,92 +28,113 @@ import {
   getMessageText,
   type Message,
 } from "./messages.js";
-import { estimateTokens } from "./tokens.js";
+import { estimateTokens, calculateBudget } from "./tokens.js";
+import {
+  HistoryManager,
+  generateConversationId,
+  type SavedConversation,
+} from "./history.js";
 
 export interface ConversationStats {
-  /** Total number of messages (user + assistant). */
+  id: string;
   messageCount: number;
-  /** Number of complete turns (one user + one assistant = one turn). */
   turnCount: number;
-  /** Estimated token count for the entire history. */
   estimatedTokens: number;
+  createdAt: string;
+  budgetWarning: "ok" | "caution" | "critical";
 }
 
-/**
- * Manages the conversation history for a single session.
- *
- * The conversation is a simple array of messages that grows
- * with each turn. The full array is sent with every API call.
- */
+const BUDGET_CAUTION = 0.6;
+const BUDGET_CRITICAL = 0.8;
+
 export class Conversation {
   private messages: Message[] = [];
+  private id: string;
+  private createdAt: string;
+  private model: string;
+  private systemPrompt: string;
 
-  /**
-   * Add a user message to the conversation.
-   */
+  constructor(model: string, systemPrompt: string, id?: string) {
+    this.id = id ?? generateConversationId();
+    this.createdAt = new Date().toISOString();
+    this.model = model;
+    this.systemPrompt = systemPrompt;
+  }
+
+  getId(): string {
+    return this.id;
+  }
+
   addUserMessage(text: string): void {
     this.messages.push(MessageBuilder.user(text));
   }
 
-  /**
-   * Add an assistant message to the conversation.
-   */
   addAssistantMessage(text: string): void {
     this.messages.push(MessageBuilder.assistant(text));
   }
 
-  /**
-   * Get the full message history for an API call.
-   *
-   * This is the key method. Every API call receives this
-   * entire array. The model sees all previous turns and
-   * can reference anything that was said before.
-   *
-   * CONTEXT ENGINEERING INSIGHT: This array grows linearly
-   * with the conversation length. At ~500-2000 tokens per
-   * turn, a 30-turn conversation uses 15,000-60,000 tokens
-   * of history. This is why compression (Ch 10) is essential.
-   */
   getMessages(): Message[] {
     return [...this.messages];
   }
 
-  /**
-   * Get conversation statistics.
-   */
   getStats(): ConversationStats {
     const estimatedTokens = this.messages.reduce((total, msg) => {
       const text = getMessageText(msg);
       return total + estimateTokens(text);
     }, 0);
 
+    const budget = calculateBudget();
+    const systemTokens = estimateTokens(this.systemPrompt);
+    const totalUsed = systemTokens + estimatedTokens;
+    const ratio = totalUsed / budget.availableForInput;
+
+    let budgetWarning: "ok" | "caution" | "critical" = "ok";
+    if (ratio >= BUDGET_CRITICAL) budgetWarning = "critical";
+    else if (ratio >= BUDGET_CAUTION) budgetWarning = "caution";
+
     return {
+      id: this.id,
       messageCount: this.messages.length,
       turnCount: Math.floor(this.messages.length / 2),
       estimatedTokens,
+      createdAt: this.createdAt,
+      budgetWarning,
     };
   }
 
-  /**
-   * Get the most recent N messages.
-   * Useful for display and debugging.
-   */
   getRecentMessages(count: number): Message[] {
     return this.messages.slice(-count);
   }
 
-  /**
-   * Clear the conversation history.
-   * Starts a fresh conversation.
-   */
   clear(): void {
     this.messages = [];
   }
 
-  /**
-   * Check if the conversation is empty.
-   */
   isEmpty(): boolean {
     return this.messages.length === 0;
+  }
+
+  // -----------------------------------------------------------------
+  // Persistence (Chapter 4)
+  // -----------------------------------------------------------------
+
+  save(historyManager: HistoryManager): void {
+    const data: SavedConversation = {
+      id: this.id,
+      createdAt: this.createdAt,
+      updatedAt: new Date().toISOString(),
+      model: this.model,
+      turnCount: Math.floor(this.messages.length / 2),
+      systemPrompt: this.systemPrompt,
+      messages: this.messages,
+    };
+    historyManager.save(data);
+  }
+
+  static fromSaved(saved: SavedConversation): Conversation {
+    const conv = new Conversation(saved.model, saved.systemPrompt, saved.id);
+    conv.createdAt = saved.createdAt;
+    conv.messages = [...saved.messages];
+    return conv;
   }
 }

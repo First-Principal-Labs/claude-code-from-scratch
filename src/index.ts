@@ -1,29 +1,27 @@
 /**
- * Claude Code from Scratch — Chapter 3: System Prompts
+ * Claude Code from Scratch — Chapter 4: Conversation Management
  *
  * WHAT'S NEW IN THIS CHAPTER:
- *   - Real system prompt loaded from a template file
- *   - Template variable injection (OS, shell, cwd, date)
- *   - Environment detection
- *   - Multi-turn conversation (the model now remembers previous turns!)
- *   - Conversation statistics display
+ *   - Conversation persistence (save/load to disk as JSON)
+ *   - Resume previous conversations with /resume
+ *   - List saved conversations with /history
+ *   - Conversation IDs and metadata
+ *   - Token budget warnings (caution at 60%, critical at 80%)
+ *   - Auto-save on exit
  *
  * CONTEXT ENGINEERING CONCEPTS:
- *   - System prompt design (identity, rules, format, safety)
- *   - Instruction hierarchy (system > user > assistant > tool_result)
- *   - Template variables / dynamic system prompts
- *   - Multi-turn conversation via message history resending
+ *   - The stateless illusion — memory is just resending
+ *   - Conversation state = the message array
+ *   - Context pressure — history grows, window doesn't
+ *   - Persistence as a bridge between sessions
  *
  * Usage:
- *   npx tsx src/index.ts
+ *   npx tsx src/index.ts           # Start a new conversation
+ *   npx tsx src/index.ts --resume  # Resume most recent conversation
  *
- * Type a message and press Enter to chat. The model now remembers
- * the conversation! Type "quit" to exit, "/clear" to reset.
+ * Commands: /clear, /stats, /prompt, /save, /history, /resume, quit
  */
 
-// Must be the first import — silences Node's DEP0040 punycode warning
-// before @anthropic-ai/sdk's transitive dependencies are loaded.
-import "./silence.js";
 import Anthropic from "@anthropic-ai/sdk";
 import * as readline from "node:readline";
 import { config } from "./config.js";
@@ -39,6 +37,7 @@ import {
   formatEnvironmentForDisplay,
 } from "./core/environment.js";
 import { Conversation } from "./core/conversation.js";
+import { HistoryManager } from "./core/history.js";
 
 // -----------------------------------------------------------------------
 // Initialize
@@ -46,64 +45,72 @@ import { Conversation } from "./core/conversation.js";
 
 const client = new Anthropic();
 const tokenTracker = new TokenTracker();
-const conversation = new Conversation();
-
-// Build the system prompt with environment variables injected
+const historyManager = new HistoryManager();
 const systemPrompt = buildSystemPrompt();
 
+// Check for --resume flag
+const shouldResume = process.argv.includes("--resume");
+
+// Create or resume a conversation
+let conversation: Conversation;
+
+if (shouldResume) {
+  const saved = historyManager.list();
+  if (saved.length > 0) {
+    const mostRecent = historyManager.load(saved[0].id);
+    if (mostRecent) {
+      conversation = Conversation.fromSaved(mostRecent);
+    } else {
+      conversation = new Conversation(config.model, systemPrompt.text);
+    }
+  } else {
+    conversation = new Conversation(config.model, systemPrompt.text);
+  }
+} else {
+  conversation = new Conversation(config.model, systemPrompt.text);
+}
+
 // -----------------------------------------------------------------------
-// Multi-Turn Chat
-//
-// CONTEXT ENGINEERING CONCEPT: Conversation History
-//
-// THIS IS THE KEY CHANGE FROM CHAPTER 2.
-//
-// In Chapter 2, we sent a single message per API call — no history.
-// Now, we maintain a Conversation object that accumulates all
-// messages. Every API call sends the FULL HISTORY.
-//
-// The model sees:
-//   [system prompt] + [user 1] + [assistant 1] + [user 2] + ...
-//
-// This creates the illusion of memory. The model doesn't actually
-// remember anything — we just resend everything it needs to know.
+// Chat Function
 // -----------------------------------------------------------------------
 
 async function chat(userInput: string): Promise<string> {
-  // Add the user's message to conversation history
   conversation.addUserMessage(userInput);
 
   const message = await client.messages.create({
     model: config.model,
     max_tokens: config.maxTokens,
     system: systemPrompt.text,
-    messages: conversation.getMessages(), // ← FULL HISTORY sent every time
+    messages: conversation.getMessages(),
   });
 
-  // Record token usage
   tokenTracker.recordUsage({
     inputTokens: message.usage.input_tokens,
     outputTokens: message.usage.output_tokens,
   });
 
-  // Extract text from response
   const textBlock = message.content.find((block) => block.type === "text");
   const responseText =
     textBlock && textBlock.type === "text"
       ? textBlock.text
       : "(no text response)";
 
-  // Add assistant response to conversation history
   conversation.addAssistantMessage(responseText);
 
-  // Display per-turn stats
-  const budget = calculateBudget();
-  const utilization = contextUtilization(message.usage.input_tokens);
+  // Display per-turn stats with budget warning
   const stats = conversation.getStats();
+  const utilization = contextUtilization(message.usage.input_tokens);
+
+  let warning = "";
+  if (stats.budgetWarning === "critical") {
+    warning = " *** CRITICAL: Context nearly full! Use /clear or expect degraded performance.";
+  } else if (stats.budgetWarning === "caution") {
+    warning = " (caution: context filling up)";
+  }
 
   console.log();
   console.log(
-    `  [Turn ${stats.turnCount}] ${message.usage.input_tokens} in → ${message.usage.output_tokens} out | Window: ${utilization.toFixed(1)}% used`
+    `  [Turn ${stats.turnCount}] ${message.usage.input_tokens} in → ${message.usage.output_tokens} out | Window: ${utilization.toFixed(1)}% used${warning}`
   );
   console.log();
 
@@ -111,34 +118,32 @@ async function chat(userInput: string): Promise<string> {
 }
 
 // -----------------------------------------------------------------------
-// Main — CLI Loop with Multi-Turn
+// Main — CLI Loop
 // -----------------------------------------------------------------------
 
 async function main(): Promise<void> {
   const budget = calculateBudget();
   const env = detectEnvironment();
+  const stats = conversation.getStats();
 
   console.log("=".repeat(60));
-  console.log("  Claude Code from Scratch — Chapter 3");
-  console.log("  System Prompts: Programming the Brain");
+  console.log("  Claude Code from Scratch — Chapter 4");
+  console.log("  Conversation Management");
   console.log("=".repeat(60));
   console.log();
   console.log(formatEnvironmentForDisplay(env));
   console.log();
   console.log(`  Model:          ${config.model}`);
-  console.log(
-    `  Context window: ${formatTokenCount(budget.total)} tokens`
-  );
-  console.log(
-    `  System prompt:  ~${systemPrompt.estimatedTokens} tokens`
-  );
+  console.log(`  Context window: ${formatTokenCount(budget.total)} tokens`);
+  console.log(`  System prompt:  ~${systemPrompt.estimatedTokens} tokens`);
+  console.log(`  Conversation:   ${stats.id}`);
+
+  if (!conversation.isEmpty()) {
+    console.log(`  Resumed:        ${stats.turnCount} turns, ~${stats.estimatedTokens} tokens of history`);
+  }
+
   console.log();
-  console.log(
-    "  The model now remembers the conversation!"
-  );
-  console.log(
-    "  Commands: /clear (reset), /stats (usage), /prompt (view), quit"
-  );
+  console.log("  Commands: /save, /history, /resume, /clear, /stats, /prompt, quit");
   console.log("-".repeat(60));
   console.log();
 
@@ -156,63 +161,111 @@ async function main(): Promise<void> {
         return;
       }
 
-      // Handle exit
-      if (
-        trimmed.toLowerCase() === "quit" ||
-        trimmed.toLowerCase() === "exit"
-      ) {
+      // --- Exit ---
+      if (trimmed.toLowerCase() === "quit" || trimmed.toLowerCase() === "exit") {
+        // Auto-save on exit if conversation has content
+        if (!conversation.isEmpty()) {
+          conversation.save(historyManager);
+          console.log(`  Auto-saved conversation ${conversation.getId()}`);
+        }
         console.log();
         console.log("-".repeat(60));
         console.log(tokenTracker.formatSessionSummary());
-        const stats = conversation.getStats();
-        console.log(`  Turns:          ${stats.turnCount}`);
-        console.log(`  History tokens: ~${stats.estimatedTokens}`);
+        const finalStats = conversation.getStats();
+        console.log(`  Turns:          ${finalStats.turnCount}`);
+        console.log(`  History tokens: ~${finalStats.estimatedTokens}`);
         console.log("-".repeat(60));
         console.log();
-        console.log(
-          "  Chapter 3 complete. Next: Ch 4 — Conversation Management"
-        );
+        console.log("  Chapter 4 complete. Next: Ch 5 — Tool Use");
         console.log();
         rl.close();
         return;
       }
 
-      // Handle slash commands
+      // --- Slash Commands ---
+      if (trimmed.toLowerCase() === "/save") {
+        conversation.save(historyManager);
+        console.log(`  Saved conversation ${conversation.getId()}\n`);
+        prompt();
+        return;
+      }
+
+      if (trimmed.toLowerCase() === "/history") {
+        const saved = historyManager.list();
+        if (saved.length === 0) {
+          console.log("  No saved conversations.\n");
+        } else {
+          console.log();
+          console.log("  Saved conversations:");
+          for (const s of saved.slice(0, 10)) {
+            console.log(`    ${s.id} (${s.turnCount} turns) — ${s.preview}`);
+          }
+          console.log();
+        }
+        prompt();
+        return;
+      }
+
+      if (trimmed.toLowerCase().startsWith("/resume")) {
+        const parts = trimmed.split(/\s+/);
+        let targetId: string | undefined;
+
+        if (parts.length > 1) {
+          targetId = parts[1];
+        } else {
+          const saved = historyManager.list();
+          if (saved.length > 0) {
+            targetId = saved[0].id;
+          }
+        }
+
+        if (targetId) {
+          const loaded = historyManager.load(targetId);
+          if (loaded) {
+            conversation = Conversation.fromSaved(loaded);
+            const resumedStats = conversation.getStats();
+            console.log(`  Resumed ${targetId} (${resumedStats.turnCount} turns)\n`);
+          } else {
+            console.log(`  Conversation ${targetId} not found.\n`);
+          }
+        } else {
+          console.log("  No saved conversations to resume.\n");
+        }
+        prompt();
+        return;
+      }
+
       if (trimmed.toLowerCase() === "/clear") {
-        conversation.clear();
-        console.log("  Conversation cleared. Starting fresh.\n");
+        conversation = new Conversation(config.model, systemPrompt.text);
+        console.log("  New conversation started.\n");
         prompt();
         return;
       }
 
       if (trimmed.toLowerCase() === "/stats") {
-        const stats = conversation.getStats();
+        const s = conversation.getStats();
         const sessionUsage = tokenTracker.getSessionUsage();
         console.log();
-        console.log(`  Messages:       ${stats.messageCount}`);
-        console.log(`  Turns:          ${stats.turnCount}`);
-        console.log(`  History tokens: ~${stats.estimatedTokens}`);
-        console.log(
-          `  System prompt:  ~${systemPrompt.estimatedTokens} tokens`
-        );
-        console.log(
-          `  Session cost:   $${sessionUsage.estimatedCost.toFixed(4)}`
-        );
+        console.log(`  Conversation:   ${s.id}`);
+        console.log(`  Messages:       ${s.messageCount}`);
+        console.log(`  Turns:          ${s.turnCount}`);
+        console.log(`  History tokens: ~${s.estimatedTokens}`);
+        console.log(`  Budget status:  ${s.budgetWarning}`);
+        console.log(`  Session cost:   $${sessionUsage.estimatedCost.toFixed(4)}`);
         console.log();
         prompt();
         return;
       }
 
       if (trimmed.toLowerCase() === "/prompt") {
-        console.log();
-        console.log("--- System Prompt ---");
+        console.log("\n--- System Prompt ---");
         console.log(systemPrompt.text);
-        console.log("--- End System Prompt ---");
-        console.log();
+        console.log("--- End ---\n");
         prompt();
         return;
       }
 
+      // --- Chat ---
       try {
         const response = await chat(trimmed);
         console.log(`Claude: ${response}`);
@@ -221,9 +274,7 @@ async function main(): Promise<void> {
         if (error instanceof Error) {
           console.error(`Error: ${error.message}`);
           if (error.message.includes("API key")) {
-            console.error(
-              "Hint: Set ANTHROPIC_API_KEY in your environment or .env file."
-            );
+            console.error("Hint: Set ANTHROPIC_API_KEY in your environment or .env file.");
           }
         }
         console.log();
